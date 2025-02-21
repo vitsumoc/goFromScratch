@@ -10,7 +10,7 @@ func main() {
 		fmt.Scanln(&guess)
 		if guess == answer {
 			fmt.Println("恭喜您！猜中了！")
-			break
+			return
 		} else if guess < answer {
 			fmt.Println("您输入的数字小了，您的剩余机会：", attempts)
 		} else {
