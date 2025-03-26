@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"time"
 )
 
 func main() {
@@ -19,7 +20,7 @@ func main() {
 			continue
 		}
 		fmt.Println("客户端进入")
-		handleConn(conn)
+		go handleConn(conn)
 	}
 }
 
@@ -33,13 +34,25 @@ func handleConn(c net.Conn) {
 			return
 		}
 		msg := string(buf[:n])
-		if err != nil {
-			return
-		}
-		// 回声
-		_, err = c.Write([]byte(msg))
-		if err != nil {
-			return
+		// 按照回声的方式发送
+		if msg != "" {
+			// 去掉消息末尾的换行符
+			msg = msg[:len(msg)-1]
+			go func(msg string) {
+				for x := 0; x < 3; x++ {
+					// 这里计算小数点的数量，显得更真实一些
+					dots := ""
+					for i := 0; i <= x; i++ {
+						dots += "."
+					}
+					// 这里把小数点添加到文本之后
+					_, err := c.Write([]byte(msg + dots + "\n"))
+					if err != nil {
+						return
+					}
+					time.Sleep(1 * time.Second)
+				}
+			}(msg)
 		}
 	}
 }
