@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-var balanceLock sync.Mutex
+var balanceLocker sync.Mutex
 
 func main() {
 	var balance int = 1000 // 银行账户有 1000 元
@@ -26,7 +26,7 @@ func main() {
 }
 
 func editBalance(balance *int, n int) {
-	balanceLock.Lock()
+	balanceLocker.Lock()
 	*balance = *balance + n
-	balanceLock.Unlock()
+	balanceLocker.Unlock()
 }
