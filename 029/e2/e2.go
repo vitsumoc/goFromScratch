@@ -1,11 +1,13 @@
 package main
 
+// import "fmt"
+// import "os"
+
 import (
 	"fmt"
-
-	"gitee.com/vitsumoc/goFromScratch/029/e1"
+	"os"
 )
 
 func main() {
-	fmt.Println(e1.S1)
+	fmt.Println(os.O_CREATE)
 }
