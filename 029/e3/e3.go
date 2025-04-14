@@ -1,11 +1,5 @@
-package main
+package e3
 
-import (
-	"fmt"
+var S1 string = "hello world1"
 
-	"gitee.com/vitsumoc/goFromScratch/029/e1"
-)
-
-func main() {
-	fmt.Println(e1.S1)
-}
+var s2 string = "hello world2"
