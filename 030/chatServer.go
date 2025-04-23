@@ -1,178 +1,286 @@
 package main
 
 import (
-	"bufio"
-	"fmt"
+	"encoding/json"
 	"log"
-	"net"
+	"net/http"
 	"strings"
+	"sync"
+
+	"github.com/gorilla/websocket"
 )
 
-type client struct {
-	username    string
-	ch          chan string
-	enterResult chan bool // 用户名验证结果通道
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }
 
-type message struct {
-	c       client // 发送方
-	content string // 消息内容
+type Client struct {
+	conn     *websocket.Conn
+	username string
+	send     chan []byte
+}
+
+type Message struct {
+	Type     string `json:"type"`
+	Username string `json:"username"`
+	Content  string `json:"content"`
+	Target   string `json:"target,omitempty"`
 }
 
 var (
-	clients    = make(map[string]client) // 用户名到client的映射
-	entering   = make(chan client)
-	leaving    = make(chan client)
-	msgChannel = make(chan message) // 所有传入的消息
+	clients    = make(map[*Client]bool)
+	broadcast  = make(chan Message)
+	register   = make(chan *Client)
+	unregister = make(chan *Client)
+	mu         sync.Mutex
 )
 
-func main() {
-	listener, err := net.Listen("tcp", "0.0.0.0:7749")
+func handleConnections(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Fatal(err)
-	}
-	defer listener.Close()
-	log.Println("服务器启动，监听地址：0.0.0.0:7749")
-
-	go handleSig()
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Printf("接受连接错误: %v", err)
-			continue
-		}
-		go handleConn(conn)
-	}
-}
-
-func handleSig() {
-	for {
-		select {
-		case c := <-entering:
-			exists := false // 表示用户名是否重复
-			for _, client := range clients {
-				if client.username == c.username {
-					exists = true
-					break
-				}
-			}
-			// 未重复则加入聊天室
-			if !exists {
-				clients[c.username] = c
-			}
-			c.enterResult <- !exists
-		case c := <-leaving:
-			delete(clients, c.username)
-		case message := <-msgChannel:
-			handleMessage(message)
-		}
-	}
-}
-
-func handleConn(conn net.Conn) {
-	client := client{
-		ch:          make(chan string),
-		enterResult: make(chan bool),
-	}
-
-	// 启动消息写入协程
-	go clientWriter(conn, client)
-
-	// 获取用户名
-	fmt.Fprintln(conn, "请输入用户名：")
-	input := bufio.NewScanner(conn)
-	for input.Scan() {
-		username := strings.TrimSpace(input.Text())
-		if username == "" {
-			fmt.Fprintln(conn, "用户名不能为空，请重新输入：")
-			continue
-		}
-		client.username = username
-		// 尝试加入聊天室
-		entering <- client
-		enterResult := <-client.enterResult
-		if !enterResult {
-			fmt.Fprintln(conn, "用户名已存在，请重新输入：")
-			continue
-		}
-		break
-	}
-	// 发送欢迎消息
-	client.ch <- fmt.Sprintf("欢迎 %s 加入聊天室！", client.username)
-	msgChannel <- message{
-		client,
-		fmt.Sprintf("%s 加入了聊天室", client.username),
-	}
-
-	// 处理用户输入
-	for input.Scan() {
-		msg := input.Text()
-		if msg == "/quit" {
-			break
-		}
-		msgChannel <- message{
-			client,
-			msg,
-		}
-	}
-
-	// 用户退出
-	msgChannel <- message{
-		client,
-		fmt.Sprintf("%s 离开了聊天室", client.username),
-	}
-	leaving <- client
-	conn.Close()
-}
-
-func clientWriter(conn net.Conn, client client) {
-	for msg := range client.ch {
-		fmt.Fprintln(conn, msg)
-	}
-}
-
-func handleMessage(m message) {
-	if m.content == "" {
+		log.Println("WebSocket 升级失败:", err)
 		return
 	}
-	if strings.HasPrefix(m.content, "/") {
-		// 处理命令
-		parts := strings.SplitN(m.content, " ", 2)
-		cmd := parts[0]
-		switch cmd {
-		case "/list":
-			var userList []string
-			for username := range clients {
-				userList = append(userList, username)
+	log.Println("新客户端连接")
+
+	client := &Client{
+		conn: conn,
+		send: make(chan []byte, 256),
+	}
+
+	register <- client
+	log.Println("客户端已注册")
+
+	go handleMessages(client)
+	go handleClientSend(client)
+}
+
+func handleMessages(client *Client) {
+	defer func() {
+		log.Println("客户端断开连接:", client.username)
+		if client.username != "" {
+			// 发送用户退出消息
+			broadcast <- Message{
+				Type:    "system",
+				Content: client.username + " 离开了聊天室",
 			}
-			m.c.ch <- fmt.Sprintf("当前在线用户：%s", strings.Join(userList, ", "))
-		case "/all":
-			if len(parts) > 1 {
-				broadcast(fmt.Sprintf("%s: %s", m.c.username, parts[1]), m.c.username)
+			// 更新用户列表
+			sendUserListToAll()
+		}
+		unregister <- client
+		client.conn.Close()
+	}()
+
+	for {
+		var msg Message
+		err := client.conn.ReadJSON(&msg)
+		if err != nil {
+			log.Printf("读取消息错误: %v", err)
+			break
+		}
+		log.Printf("收到消息: %+v", msg)
+
+		switch msg.Type {
+		case "set_username":
+			log.Printf("处理 set_username 消息，当前用户名: %s", msg.Username)
+			if isUsernameTaken(msg.Username) {
+				// 发送用户名重复消息
+				jsonMsg, err := json.Marshal(Message{
+					Type:    "error",
+					Content: "用户名已存在，请重新设置",
+				})
+				if err != nil {
+					log.Printf("序列化错误消息错误: %v", err)
+					continue
+				}
+				client.send <- jsonMsg
+				continue
 			}
-		default:
-			// 处理私聊
-			if len(parts) > 1 {
-				target := strings.TrimPrefix(cmd, "/")
-				if receiver, exists := clients[target]; exists {
-					receiver.ch <- fmt.Sprintf("[私聊]%s: %s", m.c.username, parts[1])
-					m.c.ch <- fmt.Sprintf("[私聊]发送给 %s: %s", target, parts[1])
-				} else {
-					m.c.ch <- fmt.Sprintf("用户 %s 不存在", target)
+			client.username = msg.Username
+			// 发送系统消息
+			systemMsg := Message{
+				Type:    "system",
+				Content: msg.Username + " 加入了聊天室",
+			}
+			log.Printf("发送系统消息: %+v", systemMsg)
+			broadcast <- systemMsg
+			// 立即发送用户列表给所有客户端
+			log.Println("准备发送用户列表")
+			sendUserListToAll()
+		case "message":
+			if msg.Target != "" {
+				log.Printf("私聊消息: %s -> %s", client.username, msg.Target)
+				// 私聊消息
+				mu.Lock()
+				for c := range clients {
+					if c.username == msg.Target || c.username == client.username {
+						// 发送给目标用户和发送者
+						privateMsg := Message{
+							Type:     "private",
+							Username: client.username,
+							Content:  msg.Content,
+							Target:   msg.Target,
+						}
+						jsonMsg, err := json.Marshal(privateMsg)
+						if err != nil {
+							log.Printf("序列化私聊消息错误: %v", err)
+							continue
+						}
+						log.Printf("发送私聊消息: %s", string(jsonMsg))
+						c.send <- jsonMsg
+					}
+				}
+				mu.Unlock()
+			} else {
+				log.Printf("广播消息: %s: %s", client.username, msg.Content)
+				// 广播消息
+				broadcast <- Message{
+					Type:     "message",
+					Username: client.username,
+					Content:  msg.Content,
 				}
 			}
+		default:
+			log.Printf("未知消息类型: %s", msg.Type)
 		}
-	} else {
-		// 默认群发消息
-		broadcast(fmt.Sprintf("%s: %s", m.c.username, m.content), m.c.username)
 	}
 }
 
-func broadcast(msg string, excludeUsername string) {
-	for username, client := range clients {
-		if username != excludeUsername {
-			client.ch <- msg
+func handleClientSend(client *Client) {
+	defer func() {
+		log.Printf("handleClientSend 退出: %s", client.username)
+		close(client.send) // 确保 channel 被关闭
+		client.conn.Close()
+	}()
+
+	for message := range client.send {
+		log.Printf("准备发送消息给 %s: %s", client.username, string(message))
+		w, err := client.conn.NextWriter(websocket.TextMessage)
+		if err != nil {
+			log.Printf("NextWriter 错误: %v", err)
+			return
 		}
+		if _, err := w.Write(message); err != nil {
+			log.Printf("写入消息错误: %v", err)
+			return
+		}
+		if err := w.Close(); err != nil {
+			log.Printf("关闭写入器错误: %v", err)
+			return
+		}
+	}
+}
+
+func sendUserListToAll() {
+	mu.Lock()
+	userList := make([]string, 0, len(clients))
+	for client := range clients {
+		if client.username != "" {
+			userList = append(userList, client.username)
+		}
+	}
+	mu.Unlock()
+
+	log.Printf("当前在线用户: %v", userList)
+
+	// 创建用户列表消息
+	userListMsg := Message{
+		Type:    "user_list",
+		Content: strings.Join(userList, ","),
+	}
+	jsonMsg, err := json.Marshal(userListMsg)
+	if err != nil {
+		log.Printf("序列化用户列表错误: %v", err)
+		return
+	}
+	log.Printf("发送用户列表消息: %s", string(jsonMsg))
+
+	// 直接发送给所有客户端
+	mu.Lock()
+	for client := range clients {
+		select {
+		case client.send <- jsonMsg:
+			log.Printf("用户列表已发送给: %s", client.username)
+		default:
+			log.Printf("发送用户列表失败，关闭连接: %s", client.username)
+			delete(clients, client)
+		}
+	}
+	mu.Unlock()
+}
+
+func handleBroadcast() {
+	for {
+		msg := <-broadcast
+		jsonMsg, err := json.Marshal(msg)
+		if err != nil {
+			log.Printf("error marshaling message: %v", err)
+			continue
+		}
+
+		mu.Lock()
+		for client := range clients {
+			select {
+			case client.send <- jsonMsg:
+			default:
+				close(client.send)
+				delete(clients, client)
+			}
+		}
+		mu.Unlock()
+	}
+}
+
+func handleClientRegistration() {
+	for {
+		select {
+		case client := <-register:
+			log.Printf("注册新客户端: %p", client)
+			mu.Lock()
+			clients[client] = true
+			mu.Unlock()
+		case client := <-unregister:
+			log.Printf("注销客户端: %p, 用户名: %s", client, client.username)
+			mu.Lock()
+			if _, ok := clients[client]; ok {
+				// 先删除用户
+				delete(clients, client)
+				mu.Unlock()
+				// 再发送更新后的用户列表
+				sendUserListToAll()
+			} else {
+				mu.Unlock()
+			}
+		}
+	}
+}
+
+func isUsernameTaken(username string) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	for client := range clients {
+		if client.username == username {
+			return true
+		}
+	}
+	return false
+}
+
+func main() {
+	fs := http.FileServer(http.Dir("./static"))
+	http.Handle("/", fs)
+	http.HandleFunc("/ws", handleConnections)
+
+	go handleBroadcast()
+	go handleClientRegistration()
+
+	log.Println("服务器启动在 :8080")
+	err := http.ListenAndServe(":8080", nil)
+	if err != nil {
+		log.Fatal("ListenAndServe: ", err)
 	}
 }
